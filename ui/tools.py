@@ -17,7 +17,7 @@ from PySide6.QtGui import QGuiApplication, QFont
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
                                QPushButton, QTextEdit, QCheckBox, QListWidget,
                                QListWidgetItem, QFrame, QApplication, QComboBox,
-                               QGridLayout)
+                               QGridLayout, QScrollArea, QInputDialog)
 
 from core.config import save_config
 from ui.theme import card_ss, DORA
@@ -234,20 +234,128 @@ class NoteWidget(_MiniWindow):
 
 
 # ---------- 📋 待办 ----------
+class _TodoRow(QWidget):
+    """单条待办行：左边小方块(点击完成/绿色√) + 文字 + 🔔提醒开关。
+
+    通过信号把行号回传给待办窗口，由它统一读写 config。
+    """
+    toggled = Signal(int)        # 点击方块 → 切换完成状态
+    remind_toggled = Signal(int) # 点击🔔 → 切换提醒开关
+    selected = Signal(int)       # 单击文字区域 → 选中（供删除定位）
+    edit_requested = Signal(int) # 双击文字区域 → 编辑内容
+
+    def __init__(self, idx: int, text: str, done: bool,
+                 remind: bool, interval_min: int):
+        super().__init__()
+        self._idx = idx
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(4, 2, 4, 2)
+        lay.setSpacing(8)
+
+        # 完成方块：未完成=空心小方框，完成=绿底+白勾
+        self._chk = QPushButton()
+        self._chk.setFixedSize(22, 22)
+        self._chk.setCursor(Qt.PointingHandCursor)
+        self._chk.setFocusPolicy(Qt.NoFocus)
+        self._chk.setToolTip("点击标记完成 / 取消完成")
+        self._chk.clicked.connect(lambda: self.toggled.emit(self._idx))
+
+        # 待办文字
+        self._lab = QLabel(text)
+        self._lab.setWordWrap(True)
+
+        # 提醒开关
+        self._rmd = QPushButton()
+        self._rmd.setFixedSize(38, 24)
+        self._rmd.setCursor(Qt.PointingHandCursor)
+        self._rmd.setFocusPolicy(Qt.NoFocus)
+        self._rmd.setToolTip("点击开启/关闭这条待办的循环提醒（开启时设置间隔）")
+        self._rmd.clicked.connect(lambda: self.remind_toggled.emit(self._idx))
+
+        lay.addWidget(self._chk)
+        lay.addWidget(self._lab, 1)
+        lay.addWidget(self._rmd)
+        self.refresh(done, remind, interval_min)
+
+    def refresh(self, done: bool, remind: bool, interval_min: int):
+        """刷新本行的完成态、提醒态样式。"""
+        if done:
+            self._chk.setText("✓")
+            self._chk.setStyleSheet(
+                "QPushButton{background:#4caf50;color:white;border:none;"
+                "border-radius:6px;font-weight:bold;font-size:14px;}")
+            self._lab.setStyleSheet(
+                "color:#a99e8c; text-decoration:line-through;")
+        else:
+            self._chk.setText("")
+            self._chk.setStyleSheet(
+                "QPushButton{background:white;border:1.5px solid #c9bfa8;"
+                "border-radius:6px;}")
+            self._lab.setStyleSheet("color:#5a3a15;")
+        if remind:
+            self._rmd.setText(f"🔔{interval_min}")
+            self._rmd.setStyleSheet(
+                "QPushButton{background:#ffd97a;color:#7a5400;"
+                "border:1px solid #e6b84d;border-radius:8px;"
+                "font-size:11px;font-weight:bold;}")
+        else:
+            self._rmd.setText("🔕")
+            self._rmd.setStyleSheet(
+                "QPushButton{background:transparent;color:#b0a08a;border:none;"
+                "font-size:12px;}")
+        self._set_selected(False)
+
+    def _set_selected(self, sel: bool):
+        self.setStyleSheet(
+            "QWidget{background:#f7ead0;border-radius:8px;}"
+            if sel else "QWidget{background:transparent;}")
+
+    def mousePressEvent(self, e):
+        # 点击文字区域 → 选中该行（供"删除"定位），不拦截子控件点击
+        if self._lab.geometry().contains(
+                self.mapFromGlobal(e.globalPosition().toPoint())):
+            self.selected.emit(self._idx)
+        super().mousePressEvent(e)
+
+    def mouseDoubleClickEvent(self, e):
+        # 双击文字区域 → 触发编辑
+        if self._lab.geometry().contains(
+                self.mapFromGlobal(e.globalPosition().toPoint())):
+            self.edit_requested.emit(self._idx)
+        super().mouseDoubleClickEvent(e)
+
+
 class TodoWidget(_MiniWindow):
     completed = Signal(int)   # 参数：已完成的件数
 
     def __init__(self, cfg, pet_rect):
-        super().__init__("📋 待办", 320, 320)
+        super().__init__("📋 待办", 340, 360)
         self._cfg = cfg
-        self._loading = False
+        self._rows = []          # [_TodoRow,...]
+        self._selected_idx = -1
+
         self._input = QLineEdit()
         self._input.setPlaceholderText("加一件待办，回车确认…")
         self._input.returnPressed.connect(self._add)
-        self._list = QListWidget()
-        self._list.itemChanged.connect(self._on_toggled)
         self._body.addWidget(self._input)
-        self._body.addWidget(self._list, 1)
+
+        # 待办列表（可滚动）。滚动区视口与内容容器用与卡片一致的暖白实底，
+        # 既避免系统暗夜模式下的默认深色背景（黑块），也不依赖透明导致露桌面。
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setFrameShape(QFrame.NoFrame)
+        self._scroll.setStyleSheet(
+            f"QScrollArea{{background:{DORA['white']};border:none;}}")
+        self._scroll.viewport().setStyleSheet(
+            f"background:{DORA['white']};")
+        self._list_host = QWidget()
+        self._list_host.setStyleSheet(f"background:{DORA['white']};")
+        self._list_lay = QVBoxLayout(self._list_host)
+        self._list_lay.setContentsMargins(0, 0, 0, 0)
+        self._list_lay.setSpacing(2)
+        self._list_lay.addStretch(1)
+        self._scroll.setWidget(self._list_host)
+        self._body.addWidget(self._scroll, 1)
 
         row = QHBoxLayout()
         btn_add = QPushButton("添加")
@@ -258,61 +366,132 @@ class TodoWidget(_MiniWindow):
         row.addWidget(btn_del)
         row.addStretch(1)
         self._body.addLayout(row)
+
         self._reload()
         self.show_near(pet_rect)
 
+    # ---------- 数据与显示 ----------
     def _reload(self):
-        # 用 _loading 标志屏蔽重建列表期间的 itemChanged，避免反复重连
-        self._loading = True
-        self._list.clear()
-        # 注意：PySide6 对 setData 的 Python dict 取出时会拷贝，
-        # 所以这里只存行号，勾选时再按行号取真实对象修改。
+        while self._list_lay.count() > 1:
+            it = self._list_lay.takeAt(0)
+            w = it.widget()
+            if w is not None:
+                w.deleteLater()
+        self._rows = []
+        self._selected_idx = -1
         for idx, t in enumerate(self._cfg.get("tools_todos", [])):
-            text = t.get("text", "")
-            item = QListWidgetItem(("☑ " if t.get("done") else "☐ ") + text)
-            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
-            item.setCheckState(Qt.Checked if t.get("done") else Qt.Unchecked)
-            item.setData(Qt.UserRole, idx)
-            self._list.addItem(item)
-        self._loading = False
+            rw = _TodoRow(idx, t.get("text", ""), bool(t.get("done")),
+                          bool(t.get("remind")),
+                          int(t.get("remind_interval_min", 60) or 60))
+            rw.toggled.connect(self._toggle)
+            rw.remind_toggled.connect(self._toggle_remind)
+            rw.selected.connect(self._select)
+            rw.edit_requested.connect(self._edit)
+            self._list_lay.insertWidget(self._list_lay.count() - 1, rw)
+            self._rows.append(rw)
 
+    def _refresh_row(self, idx: int):
+        if not (0 <= idx < len(self._rows)):
+            return
+        todos = self._cfg.get("tools_todos", [])
+        if idx >= len(todos):
+            return
+        t = todos[idx]
+        self._rows[idx].refresh(bool(t.get("done")), bool(t.get("remind")),
+                                int(t.get("remind_interval_min", 60) or 60))
+
+    def _select(self, idx: int):
+        self._selected_idx = idx
+        for i, rw in enumerate(self._rows):
+            rw._set_selected(i == idx)
+
+    # ---------- 操作 ----------
     def _add(self):
         text = self._input.text().strip()
         if not text:
             return
         self._cfg.setdefault("tools_todos", []).append(
-            {"text": text, "done": False})
+            {"text": text, "done": False, "remind": False,
+             "remind_interval_min": 60})
         self._input.clear()
         self._reload()
         save_config(self._cfg)
 
     def _del(self):
-        row = self._list.currentRow()
+        idx = self._selected_idx
         todos = self._cfg.get("tools_todos", [])
-        if 0 <= row < len(todos):
-            del todos[row]
+        if 0 <= idx < len(todos):
+            del todos[idx]
             self._reload()
             save_config(self._cfg)
 
-    def _on_toggled(self, item):
-        if self._loading:
-            return
-        idx = item.data(Qt.UserRole)
+    def _edit(self, idx: int):
+        """双击某行 → 弹出输入框修改内容，空输入视为删除。"""
         todos = self._cfg.get("tools_todos", [])
-        if idx is None or not (0 <= idx < len(todos)):
+        if not (0 <= idx < len(todos)):
+            return
+        old_text = todos[idx].get("text", "")
+        new_text, ok = QInputDialog.getText(
+            self, "修改待办", "修改内容：", text=old_text)
+        if not ok:
+            return
+        new_text = new_text.strip()
+        if not new_text:
+            # 空输入 → 删除这条
+            del todos[idx]
+            self._reload()
+            save_config(self._cfg)
+            return
+        todos[idx]["text"] = new_text
+        self._reload()
+        save_config(self._cfg)
+
+    def _toggle(self, idx: int):
+        todos = self._cfg.get("tools_todos", [])
+        if not (0 <= idx < len(todos)):
             return
         t = todos[idx]
-        done = item.checkState() == Qt.Checked
-        if done and not t.get("done"):
-            t["done"] = True
-            item.setText("☑ " + t.get("text", ""))
-            save_config(self._cfg)
+        t["done"] = not t.get("done")
+        self._refresh_row(idx)
+        save_config(self._cfg)
+        if t["done"]:
             done_count = sum(1 for x in todos if x.get("done"))
             self.completed.emit(done_count)
-        elif not done and t.get("done"):
-            t["done"] = False
-            item.setText("☐ " + t.get("text", ""))
-            save_config(self._cfg)
+
+    def _toggle_remind(self, idx: int):
+        todos = self._cfg.get("tools_todos", [])
+        if not (0 <= idx < len(todos)):
+            return
+        t = todos[idx]
+        if t.get("remind"):
+            t["remind"] = False
+        else:
+            interval = self._pick_interval(t)
+            if interval is None:
+                return
+            t["remind"] = True
+            t["remind_interval_min"] = interval
+        save_config(self._cfg)
+        self._refresh_row(idx)
+
+    def _pick_interval(self, t) -> int | None:
+        items = [("30 分钟", 30), ("45 分钟", 45), ("60 分钟", 60),
+                 ("90 分钟", 90), ("120 分钟", 120), ("180 分钟", 180)]
+        labels = [k for k, _ in items]
+        vals = dict(items)
+        cur = int(t.get("remind_interval_min", 60) or 60)
+        cur_ix = 2
+        for i, (_, v) in enumerate(items):
+            if v == cur:
+                cur_ix = i
+                break
+        text, ok = QInputDialog.getItem(
+            self, "⏰ 提醒间隔",
+            "每隔多久提醒一次这条待办？（未完成前循环提醒）",
+            labels, cur_ix, False)
+        if not ok or not text:
+            return None
+        return vals.get(text, 60)
 
     def save_state(self):
         pass

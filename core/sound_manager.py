@@ -73,6 +73,24 @@ def _noise(dur: float, amp: float = 0.15) -> list:
     return [int(amp * 32767 * (random.random() * 2 - 1)) for _ in range(n)]
 
 
+def _bell(freq: float, dur: float, amp: float = 0.4, decay: float = 6.0,
+          harmonics: tuple = (0.5, 0.24)) -> list:
+    """钟琴/八音盒音：基频 + 小节泛音，指数衰减，听起来温暖柔和。
+
+    想更"叮当"就把 harmonics 调大（明亮），更"闷"就把 decay 调大（短促）。
+    """
+    n = int(SAMPLE_RATE * dur)
+    out = []
+    for i in range(n):
+        t = i / SAMPLE_RATE
+        env = math.exp(-decay * t / dur)   # 指数衰减到接近 0
+        v = math.sin(2 * math.pi * freq * t) \
+            + harmonics[0] * math.sin(2 * math.pi * freq * 2 * t) \
+            + harmonics[1] * math.sin(2 * math.pi * freq * 3 * t)
+        out.append(int(amp * 32767 * env * v))
+    return _envelope(out, 0.006, 0.02)
+
+
 def _write_wav(path: str, samples: list):
     """将 16-bit mono 样本列表写入 wav 文件。"""
     samples = _envelope(samples)
@@ -88,122 +106,204 @@ def _write_wav(path: str, samples: list):
 # 用函数延迟生成，避免 import 时执行
 
 def _gen_click(p):
-    _write_wav(p, _sine(1000, 0.08))
+    """轻触，柔和小"啵"声。"""
+    _write_wav(p, _bell(1046, 0.07, 0.22, decay=8))
 
 def _gen_wave(p):
-    _write_wav(p, _sweep(500, 700, 0.25))
-
-def _gen_feed(p):
-    """快速咀嚼声：4 个短脉冲。"""
-    parts = []
-    for _ in range(4):
-        parts.append(_sine(200 + 100 * (_ % 2), 0.04, 0.3))
-        parts.append([0] * int(SAMPLE_RATE * 0.03))
-    _write_wav(p, _concat(*parts))
-
-def _gen_pocket(p):
-    """魔法星星：4 个上升音阶。"""
-    parts = []
-    for f in (400, 600, 800, 1000):
-        parts.append(_sine(f, 0.1, 0.35))
-        parts.append([0] * int(SAMPLE_RATE * 0.04))
-    _write_wav(p, _concat(*parts))
-
-def _gen_wake(p):
-    _write_wav(p, _sweep(300, 600, 0.3))
-
-def _gen_sleep(p):
-    _write_wav(p, _sweep(400, 200, 0.5))
-
-def _gen_yawn(p):
-    _write_wav(p, _sweep(300, 150, 0.7))
-
-def _gen_chat_in(p):
+    """打招呼：温柔上行的两音钟琴 C5→E5，像"叮～叮"的问候。"""
     _write_wav(p, _concat(
-        _sine(600, 0.08, 0.3),
-        [0] * int(SAMPLE_RATE * 0.04),
-        _sine(800, 0.08, 0.3),
+        _bell(523, 0.14, 0.32),
+        [0] * int(SAMPLE_RATE * 0.06),
+        _bell(659, 0.16, 0.36),
     ))
 
+def _gen_feed(p):
+    """喂食：轻快归巢小琶音，柔软不吵。"""
+    gap = [0] * int(SAMPLE_RATE * 0.05)
+    _write_wav(p, _concat(
+        _bell(392, 0.09, 0.28, decay=9),
+        gap,
+        _bell(440, 0.09, 0.28, decay=9),
+        gap,
+        _bell(523, 0.16, 0.34, decay=7),
+    ))
+
+def _gen_pocket(p):
+    """魔法星星：C-E-G-C 上行琶音，八音盒般温暖明亮。"""
+    gap = [0] * int(SAMPLE_RATE * 0.05)
+    _write_wav(p, _concat(
+        _bell(523, 0.12, 0.3, decay=7),
+        gap,
+        _bell(659, 0.12, 0.3, decay=7),
+        gap,
+        _bell(784, 0.12, 0.3, decay=7),
+        gap,
+        _bell(1046, 0.22, 0.38, decay=6),
+    ))
+
+def _gen_wake(p):
+    """醒来：温柔上行的滑音，轻快朝气。"""
+    _write_wav(p, _concat(
+        _bell(330, 0.14, 0.28),
+        [0] * int(SAMPLE_RATE * 0.04),
+        _bell(523, 0.18, 0.32),
+    ))
+
+def _gen_sleep(p):
+    """睡觉：柔和下行两音，像轻轻道晚安。"""
+    _write_wav(p, _concat(
+        _bell(523, 0.2, 0.3),
+        [0] * int(SAMPLE_RATE * 0.06),
+        _bell(392, 0.26, 0.28),
+    ))
+
+def _gen_yawn(p):
+    """打哈欠：很低很柔的下行拖音，慵懒。"""
+    _write_wav(p, _sweep(280, 130, 0.7, 0.22))
+
+def _gen_chat_in(p):
+    """来消息：柔和清脆的一声"叮"。"""
+    _write_wav(p, _bell(880, 0.16, 0.34, decay=6))
+
 def _gen_chat_out(p):
-    _write_wav(p, _sine(500, 0.1, 0.3))
+    """发消息：更轻的一声"提"。"""
+    _write_wav(p, _bell(659, 0.1, 0.3, decay=8))
 
 def _gen_reminder(p):
-    """三连短促提醒音。"""
-    parts = []
-    for _ in range(3):
-        parts.append(_sine(500, 0.06, 0.35))
-        parts.append([0] * int(SAMPLE_RATE * 0.05))
-    _write_wav(p, _concat(*parts))
+    """提醒：三连温柔"叮咚～叮咚～叮咚"，下行三度，微信门铃的温柔版。"""
+    gap = [0] * int(SAMPLE_RATE * 0.1)
+    _write_wav(p, _concat(
+        _bell(784, 0.16, 0.34, decay=7),
+        _bell(659, 0.22, 0.32, decay=7),
+        gap,
+        _bell(784, 0.16, 0.34, decay=7),
+        _bell(659, 0.22, 0.32, decay=7),
+        gap,
+        _bell(784, 0.16, 0.34, decay=7),
+        _bell(659, 0.24, 0.32, decay=7),
+    ))
 
 def _gen_achievement(p):
-    """胜利号角：4 个上升音符。"""
-    parts = []
-    for f in (300, 500, 700, 900):
-        parts.append(_sine(f, 0.15, 0.35))
-        parts.append([0] * int(SAMPLE_RATE * 0.04))
-    _write_wav(p, _concat(*parts))
+    """完成：明亮欢快的上行琶音 C-E-G-C，有成就感又不突兀。"""
+    gap = [0] * int(SAMPLE_RATE * 0.05)
+    _write_wav(p, _concat(
+        _bell(523, 0.12, 0.3, decay=7),
+        gap,
+        _bell(659, 0.12, 0.3, decay=7),
+        gap,
+        _bell(784, 0.12, 0.3, decay=7),
+        gap,
+        _bell(1046, 0.26, 0.4, decay=5),
+        [0] * int(SAMPLE_RATE * 0.05),
+        _bell(784, 0.2, 0.28, decay=6),
+    ))
 
 def _gen_heart(p):
-    _write_wav(p, _sine(400, 0.3, 0.25))
+    """爱心：缓慢柔和的低音"咚"，像贴心的心跳。"""
+    _write_wav(p, _bell(262, 0.34, 0.3, decay=5))
 
 def _gen_error(p):
-    _write_wav(p, _sweep(400, 200, 0.3))
+    """出错：柔和的下行"嚸～嘟"，不太刺耳。"""
+    _write_wav(p, _concat(
+        _bell(440, 0.14, 0.3, decay=7),
+        [0] * int(SAMPLE_RATE * 0.04),
+        _bell(330, 0.22, 0.28, decay=6),
+    ))
 
 def _gen_happy(p):
-    _write_wav(p, _sweep(500, 800, 0.3))
+    """开心：轻快上行 D-F#-A 三连，像雀跃。"""
+    gap = [0] * int(SAMPLE_RATE * 0.045)
+    _write_wav(p, _concat(
+        _bell(587, 0.1, 0.3, decay=8),
+        gap,
+        _bell(740, 0.1, 0.3, decay=8),
+        gap,
+        _bell(880, 0.2, 0.34, decay=6),
+    ))
 
 def _gen_sad(p):
-    _write_wav(p, _sweep(500, 200, 0.4))
+    """难过：柔和下行 A→F，温度低一些但不刺耳。"""
+    _write_wav(p, _concat(
+        _bell(440, 0.18, 0.28),
+        [0] * int(SAMPLE_RATE * 0.05),
+        _bell(349, 0.24, 0.24),
+    ))
 
 def _gen_proud(p):
-    _write_wav(p, _sweep(400, 600, 0.3))
+    """得意：上扬的一小段，轻点"叮~滴"。"""
+    _write_wav(p, _bell(660, 0.14, 0.32, decay=8))
 
 def _gen_faint(p):
-    """晕眩：交替音。"""
-    parts = []
-    for _ in range(5):
-        parts.append(_sine(200, 0.05, 0.3))
-        parts.append(_sine(300, 0.05, 0.3))
-    _write_wav(p, _concat(*parts))
+    """晕眩：轻轻高低交替，像飘忽。"""
+    gap = [0] * int(SAMPLE_RATE * 0.04)
+    _write_wav(p, _concat(
+        _bell(392, 0.08, 0.24, decay=9),
+        _bell(294, 0.08, 0.24, decay=9),
+        gap,
+        _bell(392, 0.08, 0.24, decay=9),
+        _bell(294, 0.08, 0.24, decay=9),
+    ))
 
 def _gen_thinking(p):
-    _write_wav(p, _sine(300, 0.2, 0.25))
+    """思考：一声轻柔拉长的"叮～"。"""
+    _write_wav(p, _bell(440, 0.28, 0.3, decay=5))
 
 def _gen_notify(p):
+    """通知：双音"叮叮"G5→C6，清晰轻快。"""
     _write_wav(p, _concat(
-        _sine(700, 0.1, 0.3),
-        [0] * int(SAMPLE_RATE * 0.03),
-        _sine(900, 0.1, 0.3),
+        _bell(784, 0.12, 0.3, decay=8),
+        [0] * int(SAMPLE_RATE * 0.05),
+        _bell(1046, 0.16, 0.32, decay=7),
     ))
 
 def _gen_app_launch(p):
-    _write_wav(p, _sweep(500, 700, 0.2))
+    """应用启动：两音上行 C5→G5，欢快。"""
+    _write_wav(p, _concat(
+        _bell(523, 0.11, 0.3, decay=8),
+        [0] * int(SAMPLE_RATE * 0.05),
+        _bell(784, 0.16, 0.32, decay=7),
+    ))
 
 def _gen_pomodoro(p):
-    """番茄钟：三个短促的高音。"""
-    parts = []
-    for _ in range(3):
-        parts.append(_sine(800, 0.08, 0.35))
-        parts.append([0] * int(SAMPLE_RATE * 0.04))
-    _write_wav(p, _concat(*parts))
+    """番茄钟结束：三下柔和高音"叮叮叮"，提醒但不吵。"""
+    gap = [0] * int(SAMPLE_RATE * 0.09)
+    _write_wav(p, _concat(
+        _bell(880, 0.14, 0.3, decay=8),
+        gap,
+        _bell(988, 0.14, 0.3, decay=8),
+        gap,
+        _bell(1046, 0.22, 0.34, decay=6),
+    ))
 
 def _gen_rps_ready(p):
+    """猜拳预备：阶梯三音 C5-D5-E5，期待感。"""
+    gap = [0] * int(SAMPLE_RATE * 0.04)
     _write_wav(p, _concat(
-        _sine(400, 0.08, 0.3),
-        _sine(600, 0.08, 0.3),
-        _sine(800, 0.08, 0.3),
+        _bell(523, 0.1, 0.28, decay=9),
+        gap,
+        _bell(587, 0.1, 0.28, decay=9),
+        gap,
+        _bell(659, 0.1, 0.28, decay=9),
     ))
 
 def _gen_rps_win(p):
+    """猜拳胜利：欢快上行 G5-C6-E6。"""
+    gap = [0] * int(SAMPLE_RATE * 0.05)
     _write_wav(p, _concat(
-        _sine(600, 0.1, 0.3),
-        _sine(900, 0.1, 0.3),
-        _sine(1200, 0.15, 0.35),
+        _bell(784, 0.12, 0.3, decay=8),
+        gap,
+        _bell(1046, 0.12, 0.3, decay=8),
+        gap,
+        _bell(1318, 0.2, 0.34, decay=6),
     ))
 
 def _gen_rps_lose(p):
-    _write_wav(p, _sweep(400, 200, 0.4))
+    """猜拳输：柔和下行，轻轻鼓励。"""
+    _write_wav(p, _concat(
+        _bell(440, 0.14, 0.26),
+        [0] * int(SAMPLE_RATE * 0.04),
+        _bell(330, 0.22, 0.24),
+    ))
 
 
 # 音效注册表：name -> 生成函数

@@ -9,6 +9,8 @@
 快捷键（Ctrl+Alt+字母）：
   Q → 呼出/隐藏桌宠    L → 打开聊天
   Z → 防打扰开关        I → AI 直达菜单
+  P → 播放/暂停音乐     N → 下一首      B → 上一首
+  M → 显示/隐藏歌词行（控制栏内）
 """
 import ctypes
 import threading
@@ -27,13 +29,18 @@ HWND_MESSAGE = -3
 # 虚拟键码: A-Z
 _VK = {chr(0x41 + i): 0x41 + i for i in range(26)}
 
-# 默认快捷键映射: 功能 key → 字母（仅 4 个）
+# 默认快捷键映射: 功能 key → 字母
 # 注：C/A 在本机被占用（A 多为微信截图），改用 L/I
 DEFAULT_MAP = {
     "toggle_pet": "Q",
     "chat": "L",
     "aiweb": "I",
     "dnm": "Z",
+    "music_play": "P",
+    "music_next": "N",
+    "music_prev": "B",
+    "music_lyric": "M",
+    "clips": "V",
 }
 
 # 功能 key → 可读名称
@@ -42,6 +49,11 @@ FUNC_NAMES = {
     "chat": "打开聊天",
     "aiweb": "AI 直达菜单",
     "dnm": "防打扰开关",
+    "music_play": "播放/暂停音乐",
+    "music_next": "下一首",
+    "music_prev": "上一首",
+    "music_lyric": "显示/隐藏歌词行",
+    "clips": "剪贴板历史",
 }
 
 _user32 = ctypes.windll.user32

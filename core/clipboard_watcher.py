@@ -14,7 +14,8 @@ from PySide6.QtCore import QObject, Signal
 from PySide6.QtGui import QGuiApplication
 
 COOLDOWN = 8.0  # 两次主动提示的最小间隔（秒）
-TYPE_NAMES = {"url": "链接", "code": "代码", "command": "命令", "text": "长文本"}
+TYPE_NAMES = {"url": "链接", "code": "代码", "command": "命令", "text": "长文本",
+              "foreign": "外文", "amount": "金额", "unit": "单位"}
 
 _URL_RE = re.compile(r"^https?://\S+$", re.I)
 _CODE_HINTS = re.compile(
@@ -26,6 +27,8 @@ _CMD_RE = re.compile(
     r"whoami|hostname|systeminfo|date|time|ver|path|docker|kubectl|sudo|"
     r"curl|wget|setx|mkdir|rmdir|copy|del|cls|chcp)\b",
     re.I)
+# 外文检测：包含英文字母且长度>=5，排除纯数字/符号
+_FOREIGN_RE = re.compile(r"[a-zA-Z]{2,}")
 
 
 def classify(text: str):
@@ -42,6 +45,18 @@ def classify(text: str):
             return ("text", t)
     if "\n" not in t and len(t) <= 200 and _CMD_RE.match(t):
         return ("command", t)
+    # 金额检测：1-100字符，包含数字和货币符号/代码
+    if "\n" not in t and 1 <= len(t) <= 100:
+        from core.exchange_rate import parse_amount
+        if parse_amount(t):
+            return ("amount", t)
+        # 单位检测：1-50字符，包含数字和单位
+        from core.unit_converter import parse_unit_value
+        if parse_unit_value(t):
+            return ("unit", t)
+    # 外文检测：5-500字符，包含连续英文字母，排除代码/命令
+    if 5 <= len(t) <= 500 and "\n" not in t and _FOREIGN_RE.search(t):
+        return ("foreign", t)
     return None
 
 
@@ -80,8 +95,9 @@ class ClipboardWatcher(QObject):
         now = time.time()
         if now - self._last_prompt < COOLDOWN:
             return
+        # 只有用户点击"忽略"后才不再提示该类型
         if ctype in self._prompted:
             return
         self._last_prompt = now
-        self._prompted.add(ctype)
+        # 不自动添加到 _prompted，让每次复制都提示
         self.detected.emit({"type": ctype, "content": content, "auto": False})

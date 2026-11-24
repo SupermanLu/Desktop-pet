@@ -361,6 +361,10 @@ class SettingsDialog(QDialog):
         self.chk_clip = QCheckBox("剪贴板助手（检测复制内容，可选收藏/解释；默认关闭，保护隐私）")
         self.chk_clip.setChecked(bool(cfg.get("clipboard_assistant_enabled", False)))
         ai_form.addRow(self.chk_clip)
+        self.chk_clip_hist = QCheckBox(
+            "保存剪贴板历史（最近 300 条，本地保存，可搜索/重新复制）")
+        self.chk_clip_hist.setChecked(bool(cfg.get("clip_history_enabled", True)))
+        ai_form.addRow(self.chk_clip_hist)
         sand_row = QHBoxLayout()
         btn_open_sand = QPushButton("打开沙盒文件夹")
         btn_open_sand.clicked.connect(self._open_sandbox)
@@ -406,6 +410,35 @@ class SettingsDialog(QDialog):
         v.addWidget(self.list_apps)
         v.addLayout(btn_row)
         inner.addWidget(app_group)
+
+        # ---- 音乐歌词（网易云集成） ----
+        music_group = QGroupBox("音乐歌词", self)
+        mf = QFormLayout(music_group)
+        self.chk_music = QCheckBox("启用音乐控制（网易云：播放/切歌）")
+        self.chk_music.setChecked(bool(cfg.get("music_enabled", True)))
+        self.chk_lyric_bar = QCheckBox("宠物下方显示歌词（点“词”键开关）")
+        self.chk_lyric_bar.setChecked(bool(cfg.get("lyric_bar_enabled", True)))
+        self.chk_lyric_trans = QCheckBox("歌词显示翻译（有翻译时）")
+        self.chk_lyric_trans.setChecked(bool(cfg.get("lyric_translate", True)))
+        self.chk_music_pet = QCheckBox("播放中宠物切换听歌形象 + 报歌名")
+        self.chk_music_pet.setChecked(bool(cfg.get("music_pet_action", True)))
+        self.chk_browser_media = QCheckBox(
+            "识别浏览器里的音乐（默认关；开着时 B 站等视频也会弹歌词）")
+        self.chk_browser_media.setChecked(
+            bool(cfg.get("browser_session_enabled", False)))
+        self.cmb_lyric_fallback = QComboBox()
+        self.cmb_lyric_fallback.addItem("弹框手动搜索", "manual")
+        self.cmb_lyric_fallback.addItem("仅显示歌名", "none")
+        cur_fb = cfg.get("lyric_fallback", "manual")
+        self.cmb_lyric_fallback.setCurrentIndex(
+            1 if cur_fb == "none" else 0)
+        mf.addRow(self.chk_music)
+        mf.addRow(self.chk_lyric_bar)
+        mf.addRow(self.chk_lyric_trans)
+        mf.addRow(self.chk_music_pet)
+        mf.addRow(self.chk_browser_media)
+        mf.addRow("无歌词时", self.cmb_lyric_fallback)
+        inner.addWidget(music_group)
 
         # ---- 按钮 ----
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
@@ -650,9 +683,17 @@ class SettingsDialog(QDialog):
         cfg["ai_web_search"] = self.chk_ai_web.isChecked()
         cfg["ai_tools_enabled"] = self.chk_ai_tools.isChecked()
         cfg["clipboard_assistant_enabled"] = self.chk_clip.isChecked()
+        cfg["clip_history_enabled"] = self.chk_clip_hist.isChecked()
         # 统计与成就
         cfg["summary_enabled"] = self.chk_summary.isChecked()
         cfg["stats_week_summary_enabled"] = self.chk_week.isChecked()
+        # 音乐歌词（网易云集成）
+        cfg["music_enabled"] = self.chk_music.isChecked()
+        cfg["lyric_bar_enabled"] = self.chk_lyric_bar.isChecked()
+        cfg["lyric_translate"] = self.chk_lyric_trans.isChecked()
+        cfg["music_pet_action"] = self.chk_music_pet.isChecked()
+        cfg["browser_session_enabled"] = self.chk_browser_media.isChecked()
+        cfg["lyric_fallback"] = self.cmb_lyric_fallback.currentData() or "manual"
         # 应用列表
         cfg["apps"] = [self.list_apps.item(i).data(Qt.UserRole)
                        for i in range(self.list_apps.count())]

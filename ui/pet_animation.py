@@ -366,7 +366,8 @@ def _mask_dilate_py(mask: bytearray, w: int, h: int, seal: int) -> bytearray:
                 continue
             x0, x1 = max(0, x - seal), min(w, x + seal + 1)
             for yy in range(y0, y1):
-                out[yy * w + x0:x1] = b'\x01' * (x1 - x0)
+                # 切片范围必须是 [yy*w+x0, yy*w+x1)，否则空切片赋值会插入元素
+                out[yy * w + x0:yy * w + x1] = b'\x01' * (x1 - x0)
     return out
 
 
@@ -633,12 +634,20 @@ class PetRenderer(QLabel):
         self._zzz_phase = 0.0            # 睡觉 Zzz 动画相位
         self._zzz_timer = QTimer(self)
         self._zzz_timer.timeout.connect(self._zzz_step)
+        # ---- 播放音乐音符特效（♪♫ 从宠物两侧升起摇曳） ----
+        self._music_notes_on = False     # 音符特效开关
+        self._note_phase = 0.0           # 音符动画相位
+        self._note_timer = QTimer(self)
+        self._note_timer.timeout.connect(self._note_step)
         self._emotion_keys = list(emotion_keys or [])  # 悬停情绪池（脸红/打滚/生气…）
         # ---- AI 动作图片素材 ----
         self._action_dir = action_dir or ""
         self._action_map = dict(action_images or {})
         self._action_cache = {}          # 动作 key -> 已去白底缩放的 QPixmap
+        self._action_movies = {}         # 动作 key -> (QMovie, {帧号: QPixmap})（GIF 动作）
         self._action_override = None     # 临时动作图（QTimer 到期后恢复）
+        self._action_override_key = None # 临时动作 key（GIF 实时帧定位用）
+        self._blush_key = None           # 悬停情绪 key（GIF 实时帧定位用）
         self._persistent_key = None      # 常驻动作 key（如睡觉）
         self._persistent_pixmap = None   # 常驻动作图
         self._work_pixmap = None         # 敲键盘工作联动图（优先级低于脸红/拖动）
@@ -803,6 +812,9 @@ class PetRenderer(QLabel):
         self._action_dir = action_dir or ""
         self._action_map = dict(action_images or {})
         self._action_cache.clear()
+        for movie, _frames in self._action_movies.values():
+            movie.stop()                 # 旧 GIF 动画停掉，防止泄漏
+        self._action_movies.clear()
         if props is not None:
             self._props = dict(props)
             self._prop_cache.clear()
@@ -895,23 +907,66 @@ class PetRenderer(QLabel):
         self.update()
 
     def _load_action(self, key: str):
-        """按动作 key 加载图片（去白底并缩放，带缓存）；不存在返回 None。"""
+        """按动作 key 加载图片（去白底并缩放，带缓存）；不存在返回 None。
+
+        GIF 支持：配置的同名 .gif 存在时自动优先（往目录丢 GIF 即动画），
+        或直接把 action_images 值配成 .gif 文件名。
+        """
         if key in self._action_cache:
             return self._action_cache[key]
         fn = self._action_map.get(key)
         if not fn:
             return None
         path = os.path.join(self._action_dir, fn)
+        if not fn.lower().endswith(".gif"):
+            alt = os.path.splitext(path)[0] + ".gif"
+            if os.path.isfile(alt):
+                path = alt          # 同名 GIF 优先：静态图自动升级为动画
         if not os.path.isfile(path):
             return None
+        if path.lower().endswith(".gif"):
+            return self._load_action_gif(key, path)
         pm = QPixmap(path)
         if pm.isNull():
             return None
+        self._action_cache[key] = self._proc_action_frame(pm)
+        return self._action_cache[key]
+
+    def _proc_action_frame(self, pm: QPixmap) -> QPixmap:
+        """单帧加工：去白底 → 缩放 → 补实深色边缘（静态/GIF 共用）。"""
         pm = strip_white_bg(pm)
         pm = pm.scaled(self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        pm = _solidify_dark_edges(pm)  # 补实深色半透明像素，避免暗色主题下黑色发虚
-        self._action_cache[key] = pm
-        return pm
+        return _solidify_dark_edges(pm)
+
+    def _load_action_gif(self, key: str, path: str):
+        """GIF 动作：QMovie 逐帧播放；每帧加工一次后缓存，循环零开销。"""
+        movie = QMovie(path, parent=self)   # 随控件销毁，防残留回调
+        if not movie.isValid():
+            return None
+        movie.jumpToFrame(0)          # 同步解码首帧
+        first = movie.currentPixmap()
+        if first.isNull():
+            return None
+        frames = {movie.currentFrameNumber(): self._proc_action_frame(first)}
+        self._action_movies[key] = (movie, frames)
+
+        def _on_frame(idx, frames=frames, movie=movie):
+            if idx not in frames:
+                frames[idx] = self._proc_action_frame(movie.currentPixmap())
+            self.update()
+
+        movie.frameChanged.connect(_on_frame)
+        movie.start()
+        self._action_cache[key] = frames[movie.currentFrameNumber()]
+        return self._action_cache[key]
+
+    def _live_frame(self, key):
+        """动作是 GIF 时返回当前帧；静态图返回 None（画原 pixmap）。"""
+        ent = self._action_movies.get(key)
+        if ent is None:
+            return None
+        movie, frames = ent
+        return frames.get(movie.currentFrameNumber())
 
     def play_action(self, key: str, seconds: float):
         """临时显示动作图片，seconds 秒后自动恢复基础形象。"""
@@ -919,6 +974,7 @@ class PetRenderer(QLabel):
         if pm is None:
             return
         self._action_override = pm
+        self._action_override_key = key
         if self._action_timer.isActive():
             self._action_timer.stop()
         self._action_timer.start(int(seconds * 1000))
@@ -928,6 +984,7 @@ class PetRenderer(QLabel):
         """立即结束临时动作图片，恢复基础形象。"""
         self._action_timer.stop()
         self._action_override = None
+        self._action_override_key = None
         self.update()
 
     def set_persistent_action(self, key: str):
@@ -1044,18 +1101,22 @@ class PetRenderer(QLabel):
         if on == self._blush_on:
             return
         self._blush_on = on
-        self._blush_pixmap = self._pick_hover_emotion() if on else None
+        self._blush_key, self._blush_pixmap = \
+            self._pick_hover_emotion() if on else (None, None)
         self.update()
 
     def _pick_hover_emotion(self):
-        """从情绪池乱序挑第一张能加载的图；无配置或全部失效时回退到脸红。"""
+        """从情绪池乱序挑第一张能加载的图；无配置或全部失效时回退到脸红。
+
+        返回 (key, pixmap)，key 供 GIF 实时帧定位。"""
         keys = list(self._emotion_keys or ["blush"])
         random.shuffle(keys)
         for k in keys:
             pm = self._load_action(k)
             if pm is not None:
-                return pm
-        return self._load_action("blush")
+                return k, pm
+        pm = self._load_action("blush")
+        return ("blush", pm) if pm is not None else (None, None)
 
     def set_drag(self, on: bool):
         """按住拖动 → 切独立形象（默认开心欢呼），松手 → 恢复。"""
@@ -1122,6 +1183,50 @@ class PetRenderer(QLabel):
     def _zzz_step(self):
         self._zzz_phase = (self._zzz_phase + 0.06) % 1.0
         self.update()
+
+    # ---------- 播放音乐音符特效（♪♫ 升起摇曳） ----------
+    def set_music_notes(self, on: bool):
+        """播放音乐时在宠物两侧飘音符；停止即收。"""
+        on = bool(on)
+        if on == self._music_notes_on:
+            return
+        self._music_notes_on = on
+        if on:
+            self._note_timer.start(120)
+        else:
+            self._note_timer.stop()
+        self.update()
+
+    def _note_step(self):
+        self._note_phase = (self._note_phase + 0.05) % 1.0
+        self.update()
+
+    def _draw_music_notes(self, painter, t):
+        """音符粒子：两侧交替升起、左右摇曳、渐隐（不受镜像影响）。"""
+        w, h = self.width(), self.height()
+        glyphs = ("♪", "♫", "♬")
+        colors = (QColor(255, 214, 92), QColor(120, 200, 255),
+                  QColor(255, 140, 130))
+        painter.save()
+        base = max(10, int(w * 0.14))
+        painter.setFont(QFont("Arial", base, QFont.Bold))
+        for i in range(4):
+            p = (t + i * 0.25) % 1.0
+            alpha = int(230 * (1 - p) * min(1.0, p * 6))   # 淡入淡出
+            if alpha <= 0:
+                continue
+            side = -1 if i % 2 == 0 else 1
+            # 从宠物两侧升起 + 正弦横向摇曳
+            x = w * 0.5 + side * w * (0.38 + 0.1 * math.sin(p * 3)) \
+                + math.sin(p * 2 * math.pi + i * 1.7) * w * 0.07
+            y = h * (0.8 - p * 0.85)
+            c = QColor(colors[i % 3])
+            c.setAlpha(alpha)
+            painter.setPen(c)
+            painter.setFont(QFont("Arial", int(base * (0.8 + 0.5 * (1 - p))),
+                                  QFont.Bold))
+            painter.drawText(int(x), int(y), glyphs[i % 3])
+        painter.restore()
 
     def set_look(self, lx: float, ly: float):
         """设置眼神跟随方向（-1~1）。
@@ -1201,26 +1306,32 @@ class PetRenderer(QLabel):
             painter.translate(self.width(), 0)
             painter.scale(-1, 1)
         # 形象优先级：临时动作 > 晕倒(快速拖动) > 常驻 > 拖动开心 > 脸红 > 工作 > 节日 > 跑步(游走) > 看书 > 基础
+        key = None
         if self._action_override is not None:
-            action_pm = self._action_override
+            action_pm, key = self._action_override, self._action_override_key
         elif self._faint_pixmap is not None:
-            action_pm = self._faint_pixmap
+            action_pm, key = self._faint_pixmap, "faint"
         elif self._persistent_pixmap is not None:
-            action_pm = self._persistent_pixmap
+            action_pm, key = self._persistent_pixmap, self._persistent_key
         elif self._drag_pixmap is not None:
-            action_pm = self._drag_pixmap
+            action_pm, key = self._drag_pixmap, "happy"
         elif self._blush_pixmap is not None:
-            action_pm = self._blush_pixmap
+            action_pm, key = self._blush_pixmap, self._blush_key
         elif self._work_pixmap is not None:
-            action_pm = self._work_pixmap
+            action_pm, key = self._work_pixmap, "work"
         elif self._festival_pixmap is not None:
-            action_pm = self._festival_pixmap
+            action_pm, key = self._festival_pixmap, self._festival_key
         elif self._running_pixmap is not None:
             action_pm = self._running_pixmap
+            key = "run_left" if self._running_frame == 0 else "run_right"
         elif self._reading_pixmap is not None:
-            action_pm = self._reading_pixmap
+            action_pm, key = self._reading_pixmap, "reading"
         else:
             action_pm = None
+        if key:
+            live = self._live_frame(key)   # GIF 动作画实时帧
+            if live is not None:
+                action_pm = live
         if action_pm is not None:
             painter.drawPixmap(self.rect(), action_pm, action_pm.rect())
         else:
@@ -1254,6 +1365,9 @@ class PetRenderer(QLabel):
             self._draw_zzz(painter, self._zzz_phase)
         elif self._state == "hang" and self.using_image:
             self._draw_hang_hands(painter)
+        # 播放音乐：两侧音符粒子（不受镜像影响）
+        if self._music_notes_on:
+            self._draw_music_notes(painter, self._note_phase)
         # 道具叠加层：显示在宠物右上侧（不随镜像翻转）
         if self._prop_override is not None:
             pw, ph = self._prop_override.width(), self._prop_override.height()

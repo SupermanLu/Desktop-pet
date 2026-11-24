@@ -13,9 +13,10 @@
 import math
 import os
 import random
+import re
 
 from PySide6.QtCore import Qt, QTimer, Signal, QPoint
-from PySide6.QtGui import (QFont, QPixmap, QPainter,
+from PySide6.QtGui import (QFont, QPixmap, QPainter, QColor,
                            QPainterPath, QTextDocument)
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
                                QPushButton, QLineEdit, QScrollArea, QWidget,
@@ -62,17 +63,98 @@ def _round_pixmap(pm: QPixmap, size: int = 36) -> QPixmap:
     return out
 
 
-class _Bubble(QLabel):
-    """圆角消息气泡。
+def _md_to_html(text: str) -> str:
+    """把常见 markdown 子集转成 QLabel 可渲染的 HTML。
 
+    支持：`**粗体**`、`*斜体*`、`- 列表项`、`# 标题`、`> 引用`、
+    `---` 分割线、行内代码 `` ` ``、换行。
+    纯文本会原样显示，不会破坏原有气泡。
+    """
+    if not text:
+        return ""
+    lines = text.split("\n")
+    html_parts = []
+    in_list = False
+    for line in lines:
+        stripped = line.strip()
+        # 分割线
+        if stripped in ("---", "***", "___"):
+            if in_list:
+                html_parts.append("</ul>")
+                in_list = False
+            html_parts.append('<hr style="border:none;border-top:1px solid #ccc;margin:6px 0;">')
+            continue
+        # 标题
+        m = re.match(r"^(#{1,3})\s+(.+)$", stripped)
+        if m:
+            if in_list:
+                html_parts.append("</ul>")
+                in_list = False
+            level = len(m.group(1))
+            sizes = {1: 18, 2: 16, 3: 15}
+            html_parts.append(f'<p style="font-weight:bold;font-size:{sizes[level]}px;margin:4px 0;">{m.group(2)}</p>')
+            continue
+        # 引用
+        if stripped.startswith("> "):
+            if in_list:
+                html_parts.append("</ul>")
+                in_list = False
+            html_parts.append(f'<p style="color:#888;border-left:3px solid #ccc;padding-left:8px;margin:4px 0;">{stripped[2:]}</p>')
+            continue
+        # 列表项
+        if stripped.startswith("- ") or stripped.startswith("* "):
+            item = stripped[2:]
+            if not in_list:
+                html_parts.append('<ul style="margin:4px 0;padding-left:20px;">')
+                in_list = True
+            html_parts.append(f"<li>{_inline_md(item)}</li>")
+            continue
+        # 普通行
+        if in_list and stripped == "":
+            html_parts.append("</ul>")
+            in_list = False
+        if stripped == "":
+            html_parts.append("<br>")
+        else:
+            html_parts.append(f'<p style="margin:2px 0;">{_inline_md(stripped)}</p>')
+    if in_list:
+        html_parts.append("</ul>")
+    return "".join(html_parts)
+
+
+def _inline_md(text: str) -> str:
+    """处理行内 markdown：`**粗体**`、`*斜体*`、`` `代码` ``。"""
+    # 先转义 HTML 特殊字符（但保留后续插入的标签）
+    text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    # 行内代码
+    text = re.sub(r"`([^`]+)`", r'<code style="background:#eee;padding:1px 4px;border-radius:3px;font-family:monospace;">\1</code>', text)
+    # 粗体
+    text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
+    # 斜体
+    text = re.sub(r"\*(.+?)\*", r"<i>\1</i>", text)
+    return text
+
+
+class _Bubble(QLabel):
+    """圆角消息气泡（自绘文本切片）。
+
+    - 支持 markdown 渲染（粗体/列表/标题/引用/代码），AI 回复不再暴露原始符号
     - 用 QTextDocument 按"实际渲染字体"精确测量换行后的宽高并 setFixedSize，
       不依赖布局自动换行（嵌套布局里 QLabel 的 wordWrap 高度不可靠）。
-    - 超长消息自动折叠（微信式）：高度超过折叠线时只显示部分内容 +
-      "展开全文"按钮，点击展开/收起。巨型气泡（几千字→数千像素高）
-      会引发 Qt 绘制残缺、文字消失、视觉重叠，折叠是根治方案。
+      测量与绘制共用同一文档实例，保证结果一致。
+    - 超长消息自动折叠（微信式）：高度超过折叠线时只显示顶部内容 +
+      "展开全文"按钮。巨型 QLabel（数千像素高）是 Qt 渲染故障重灾区
+      （文字消失、视觉重叠、布局被撑爆后各行互相叠画成"满屏聊天信息"），
+      因此控件高度永远封顶 SAFE_MAX：展开后若内容仍超高，用滚轮在
+      气泡内部滚动浏览，绝不把控件撑成巨型。
+    - 文本用 drawContents 画切片：顶部对齐、按钮区不画文字。不再用
+      嵌套 QPainter 裁剪（Qt 6.12 下 super().paintEvent 里的内建 painter
+      与外层 painter 冲突，裁剪失效，文字会溢出盖住按钮）。
+    - 代价：放弃鼠标选中文字（自绘接管后 QLabel 内建选区失效）。
     """
 
     COLLAPSE_LIMIT = 340   # 折叠高度上限（像素）
+    SAFE_MAX = 1500        # 展开后控件高度上限（防巨型 QLabel 渲染故障）
 
     def __init__(self, text: str, color: str, text_color: str,
                  max_width: int, parent=None):
@@ -86,30 +168,24 @@ class _Bubble(QLabel):
         font.setPixelSize(14)
         self.setFont(font)
         self._font = font
-        self.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        self.setWordWrap(True)
-        self.setStyleSheet(f"""
-            QLabel {{
-                background: {color};
-                color: {text_color};
-                border: none;
-                border-radius: 12px;
-                padding: 8px 12px;
-            }}
-        """)
-        self._full_h = 0            # 完整内容高度
+        # 自绘接管绘制，不再走 QLabel 的 setText / QSS 背景
+        self.setStyleSheet("")
+        self._doc = QTextDocument()
+        self._doc.setDefaultFont(self._font)
+        self._full_h = 0            # 完整内容高度（含内边距）
+        self._w = 0                 # 测量得到的宽度（不依赖 self.width()）
         self._expanded = False      # 是否处于展开状态
+        self._scroll_y = 0          # 展开后气泡内部滚动偏移（px）
         self._btn = None            # 展开/收起按钮（超长消息才有）
+        self._raw_text = text       # 保存原始文本（含 markdown）
         self._set_content(text)
 
     # ---------- 尺寸测量与折叠 ----------
     def _measure(self, text: str):
-        """返回 (宽, 完整高)。"""
-        pad_x, pad_y = 24, 16          # 与 QSS padding 8px 12px 对应
+        """返回 (宽, 完整高)。复用渲染同一文档，测量即渲染。"""
+        pad_x, pad_y = 24, 16          # 与绘制内边距 12px/8px 对应
         text_w = max(self._max_width - pad_x, 20)
-        doc = QTextDocument()
-        doc.setDefaultFont(self._font)
-        doc.setPlainText(text)
+        doc = self._doc
         # 先取"不换行"的理想宽度：短文本气泡收窄，长文本限宽换行
         ideal = doc.idealWidth()
         used_w = min(ideal, text_w)
@@ -118,17 +194,23 @@ class _Bubble(QLabel):
         return math.ceil(used_w) + pad_x, h + pad_y + 2   # +2 防末行被裁
 
     def _apply_size(self):
-        """按折叠/展开状态应用气泡尺寸，并管理按钮。"""
-        if self._expanded or self._full_h <= self.COLLAPSE_LIMIT:
-            self.setFixedSize(self.width(), max(self._full_h, 36))
+        """按折叠/展开状态应用气泡尺寸，并管理按钮。
+
+        任何状态下控件高度都不超过 SAFE_MAX，杜绝巨型 QLabel。
+        """
+        if self._full_h <= self.COLLAPSE_LIMIT:
+            self.setFixedSize(self._w, max(self._full_h, 36))
             if self._btn is not None:
                 self._btn.hide()
         else:
-            self.setFixedSize(self.width(), self.COLLAPSE_LIMIT)
+            h = min(self._full_h, self.SAFE_MAX) if self._expanded \
+                else self.COLLAPSE_LIMIT
+            self.setFixedSize(self._w, h)
             self._ensure_btn()
-            self._btn.setText("展开全文 ▾")
+            self._btn.setText("收起 ▴" if self._expanded else "展开全文 ▾")
             self._btn.show()
             self._move_btn()
+        self.update()
 
     def _ensure_btn(self):
         if self._btn is not None:
@@ -161,15 +243,8 @@ class _Bubble(QLabel):
         if self._btn is None or self._full_h <= self.COLLAPSE_LIMIT:
             return   # 非超长消息无需展开
         self._expanded = not self._expanded
-        if self._expanded:
-            self.setFixedSize(self.width(), self._full_h)
-            self._btn.setText("收起 ▴")
-            self._btn.show()
-            self._move_btn()
-        else:
-            self.setFixedSize(self.width(), self.COLLAPSE_LIMIT)
-            self._btn.setText("展开全文 ▾")
-            self._move_btn()
+        self._scroll_y = 0
+        self._apply_size()
         # 尺寸变化后通知对话框滚到该消息，避免展开后视野丢失
         dlg = self.window()
         if hasattr(dlg, "_scroll_bottom"):
@@ -180,13 +255,57 @@ class _Bubble(QLabel):
         if self._btn is not None and self._btn.isVisible():
             self._move_btn()
 
+    def wheelEvent(self, event):
+        """展开且内容超高时：滚轮在气泡内部滚动浏览，不冒泡给聊天列表。"""
+        doc_h = max(self._full_h - 18, 0)          # 文档高（去掉内边距）
+        visible_h = max(self.height() - 16 - 24, 1)  # 文本可视高（预留按钮）
+        max_scroll = max(0, doc_h - visible_h)
+        if self._expanded and max_scroll > 0:
+            self._scroll_y = max(0.0, min(float(max_scroll),
+                                self._scroll_y - event.angleDelta().y() / 2.0))
+            self.update()
+            event.accept()
+        else:
+            super().wheelEvent(event)
+
+    def paintEvent(self, event):
+        """自绘：圆角背景 + 文本切片（顶部对齐，按滚动偏移取窗）。"""
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        # 圆角背景
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(self._color))
+        painter.drawRoundedRect(self.rect().adjusted(1, 1, -1, -1), 12, 12)
+        # 文本切片：painter 裁剪出可视窗，translate 实现内部滚动。
+        # 不用 drawContents(painter, rect) 取景窗语义（PySide6 下不生效）。
+        pad_x, pad_y = 12, 8
+        btn_h = 24 if (self._btn is not None and self._btn.isVisible()) else 0
+        text_w = max(self.width() - 2 * pad_x, 20)
+        visible_h = max(self.height() - 2 * pad_y - btn_h, 1)
+        painter.setClipRect(pad_x, pad_y, text_w, visible_h)
+        painter.translate(pad_x, pad_y - self._scroll_y)
+        self._doc.setTextWidth(text_w)
+        self._doc.drawContents(painter)
+        painter.end()
+
     def _set_content(self, text: str):
-        """设置文本：测量完整宽高并应用折叠规则（重置展开状态）。"""
-        super().setText(text)
-        w, self._full_h = self._measure(text)
+        """设置文本：测量完整宽高并应用折叠规则（重置展开状态）。
+
+        直接落到最终尺寸，绝不停留在"全高"状态——setFixedSize 对布局内
+        子控件是立即生效的，瞬时数万像素的巨型尺寸会让布局/滚动条震荡，
+        绘制帧被固化后就是"满屏叠画"的乱象。
+        """
+        self._raw_text = text
+        # 外包一层 div 统一文字色（自绘后 QSS color 不再生效）
+        html = f'<div style="color:{self._text_color}">{_md_to_html(text)}</div>'
+        self._doc.setHtml(html)
+        self._w, self._full_h = self._measure(text)
         self._expanded = False
-        self.setFixedSize(w, self._full_h)   # 先按完整尺寸定宽
+        self._scroll_y = 0
         self._apply_size()
+        # 触发父布局更新，确保 AI 回复替换"…"后布局正确刷新
+        if self.parent():
+            self.parent().updateGeometry()
 
 
 class ChatDialog(QDialog):
@@ -561,6 +680,7 @@ class ChatDialog(QDialog):
 
     def _on_ai_reply(self, reply: str):
         self._history.append({"role": "assistant", "content": reply})
+        self._messages.append(("pet", reply))   # 记录展示历史，刷新重建不丢
         self.ai_finished.emit()
         # 按发送顺序填充等待气泡（连发消息时逐个消费，不丢单）
         if self._pending_bubbles:

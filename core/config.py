@@ -1,11 +1,29 @@
 # -*- coding: utf-8 -*-
-"""配置持久化：JSON 文件读写 + 默认配置。"""
+"""配置持久化：JSON 文件读写 + 默认配置。
+
+同时兼容两种运行方式：
+- 源码运行：python main.py（素材在项目 assets/，配置写在项目根目录）
+- 打包运行：PyInstaller 打包的 exe（素材从解压目录 _MEIPASS/assets 读取，
+  配置文件写在 exe 同目录，方便程序写回用户数据）
+"""
 import json
 import os
+import sys
 
-PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_SRC_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# 打包后 exe 所在目录（可写，用于存 config.json / 沙盒 / autostart.bat）
+if getattr(sys, "frozen", False):
+    PROJECT_DIR = os.path.dirname(sys.executable)
+else:
+    PROJECT_DIR = _SRC_DIR
+
 CONFIG_PATH = os.path.join(PROJECT_DIR, "config.json")
-ASSETS_DIR = os.path.join(PROJECT_DIR, "assets")
+# 素材目录：打包后从 PyInstaller 解压目录读取
+if getattr(sys, "frozen", False):
+    ASSETS_DIR = os.path.join(getattr(sys, "_MEIPASS", PROJECT_DIR), "assets")
+else:
+    ASSETS_DIR = os.path.join(_SRC_DIR, "assets")
 
 # 默认快捷应用列表：icon 为 emoji 占位，path 会被自动检测覆盖
 DEFAULT_APPS = [
@@ -63,11 +81,17 @@ DEFAULT_CONFIG = {
     # ---- 剪贴板助手（隐私沙盒，默认关闭） ----
     "clipboard_assistant_enabled": False,  # 剪贴板助手总开关
     "clipboard_prefs": {},                 # 类型偏好：{url/code/text: "always"}
+    # ---- 剪贴板历史（本地保存复制记录，可搜索/重新复制） ----
+    "clip_history_enabled": True,          # 记录开关（用户主动要求，默认开启）
+    "clip_history_limit": 300,             # 最多保存条数
     "ai_system_prompt": "你是一只住在用户桌面上的可爱宠物，名字叫小团子，"
                         "平时亲切俏皮，但也是用户身边靠谱的小助手。\n"
+                        "用户可能是学生、上班族、自由职业者或普通用户，"
+                        "做的事情可能是学习、工作、写文档、做方案、生活琐事等，"
+                        "不要预设用户是程序员，也不要动不动就提写代码。\n"
                         "回答规则：\n"
                         "1. 日常闲聊（问候、心情、玩笑等）：保持简短、亲切、带一点俏皮。\n"
-                        "2. 知识、技术、学习、实用类问题：请认真、准确、详细地解答，"
+                        "2. 学习、工作、生活、实用类问题：请认真、准确、详细地解答，"
                         "可以分点列出、给例子，不要因为宠物人设而故意回答得简单或回避问题。\n"
                         "3. 始终用中文回复。\n"
                         "4. 不知道的不要编造，可以诚实说明或建议进一步查证。",
@@ -196,6 +220,9 @@ DEFAULT_CONFIG = {
         "error":     "报错失败.png",    # 任务失败 / 报错
         "warning":   "警告提醒.png",    # 深夜提醒 / 紧急提醒
         "listening": "倾听姿势.png",    # 用户输入时倾听
+        "music":     "听音乐.png",     # 听歌中（播放常驻形象，与 music2 交替）
+        "music2":    "听音乐2.png",    # 听歌中形象2（播放时两图交替）
+        "work_music": "边工作边听音乐.png",  # 边工作边听歌（工作+播放同时）
         "stretch":   "伸懒腰.png",      # 早晨问候 / 时间情景关怀
         "fish":      "摸鱼.png",        # 下午茶摸鱼 / 时间情景关怀
         "doze":      "瞌睡图.png",      # 凌晨撑不住（打瞌睡动画）
@@ -241,6 +268,15 @@ DEFAULT_CONFIG = {
     # 每条事件: {title, date:"YYYY-MM-DD", time:"HH:MM", repeat:"none/daily/weekly/monthly",
     #            enabled:True, last_fired:""}
     "events": [],
+    # ---- 音乐（网易云集成：媒体键控制 + SMTC 检测 + 桌面歌词条） ----
+    "music_enabled": True,        # 音乐功能总开关
+    "lyric_bar_enabled": True,    # 启动时显示桌面歌词条
+    "lyric_bar_pos": None,        # 歌词条位置 [x, y]（null=屏幕底部居中）
+    "lyric_bar_locked": False,    # 锁定歌词条位置（禁止拖动）
+    "lyric_translate": True,      # 歌词条显示翻译行（tlyric）
+    "music_pet_action": True,     # 播放中宠物切"听歌"形象
+    "lyric_fallback": "manual",   # 无歌词时：manual=弹框手动搜 / none=仅歌名
+    "browser_session_enabled": False,  # 识别浏览器网页媒体（默认关：网页视频不弹歌词）
 }
 
 
@@ -267,6 +303,13 @@ def load_config() -> dict:
             pass
     else:
         save_config(cfg)
+    # ---- 一次性迁移：听歌形象旧默认（倾听姿势）→ 新默认（听音乐） ----
+    # 磁盘值优先会盖住新默认；仅当用户未自定义过该键时升级，做过标记后不再动
+    if not cfg.pop("_music_pose_migrated", False):
+        imgs = cfg.get("action_images", {})
+        if imgs.get("music") == "倾听姿势.png":
+            imgs["music"] = "听音乐.png"
+        cfg["_music_pose_migrated"] = True
     return cfg
 
 
@@ -281,9 +324,19 @@ def norm_project_path(path: str) -> str:
     config.json 中 action_img_dir / idle_dir / pet_gif 等以相对路径存储
     （如 "assets/桌宠"），随项目整体移动可移植；运行时统一转成绝对路径，
     避免依赖进程 cwd。空串或已是绝对路径则原样返回。
+
+    打包运行（frozen）时，"assets/..." 开头指向 PyInstaller 解压目录里的
+    素材；其余相对路径（沙盒等）仍指向 exe 所在目录。
     """
     if not path:
         return path
     if os.path.isabs(path):
         return path
+    if getattr(sys, "frozen", False):
+        base = getattr(sys, "_MEIPASS", PROJECT_DIR)
+        # 相对路径形如 "assets/xxx" → 素材在解压目录的 assets 下
+        if path.startswith("assets/") or path.startswith("assets\\"):
+            return os.path.normpath(os.path.join(base, path))
+        # 其它相对路径（config.json / 沙盒 / 生成的 bat）→ exe 所在目录
+        return os.path.normpath(os.path.join(PROJECT_DIR, path))
     return os.path.normpath(os.path.join(PROJECT_DIR, path))

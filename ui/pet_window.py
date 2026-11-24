@@ -169,6 +169,12 @@ class PetWindow(QWidget):
     quit_requested = Signal()
     # 全屏挂起状态变化：True=进入挂起（桌宠已隐藏），False=恢复显示
     fullscreen_paused = Signal(bool)
+    # 鼠标悬停在宠物身上变化（音乐控制栏等据此显隐）
+    hover_changed = Signal(bool)
+    # 键盘工作联动状态变化（边工作边听音乐形象据此切换）
+    work_changed = Signal(bool)
+    # 请求重启（右键菜单 → main.py 另起新实例后退出）
+    restart_requested = Signal()
 
     MOVE_THRESHOLD = 8  # px，超过视为拖拽而非点击
     SNAP_VISIBLE = 60   # 挂边后露出的像素（便于点回来）
@@ -190,6 +196,7 @@ class PetWindow(QWidget):
         self._wandering = False
         self._bubble = SpeechBubble()
         self._follow_bubbles = []   # 额外随宠物移动的气泡（如剪贴板助手按钮气泡）
+        self._music_hover = False   # 悬停广播去重（hover_changed）
 
         # ---- 交互状态机状态 ----
         self._energy_state = "normal"      # 体力系统状态（happy/normal/hungry）
@@ -529,6 +536,11 @@ class PetWindow(QWidget):
     def clear_prop(self):
         self._renderer.clear_prop()
 
+    # ---------- 播放音乐音符特效 ----------
+    def set_music_notes(self, on: bool):
+        """播放音乐时两侧飘音符（♪♫ 升起摇曳）。"""
+        self._renderer.set_music_notes(on)
+
     # ---------- 交互形象（脸红/拖动） ----------
     def set_blush(self, on: bool):
         """鼠标悬停 → 脸红。"""
@@ -762,6 +774,12 @@ class PetWindow(QWidget):
         dist = math.hypot(dx, dy)
         # 鼠标悬停在宠物身上 → 脸红（睡觉/挂边/拖动时不脸红）
         on_pet = self.frameGeometry().contains(pos)
+        # 悬停状态广播（音乐控制栏据此显隐）：隐藏/勿扰/拖动中不算
+        hover = on_pet and self.isVisible() and not self._dnm \
+            and self._drag_offset is None
+        if hover != self._music_hover:
+            self._music_hover = hover
+            self.hover_changed.emit(hover)
         self._renderer.set_blush(
             on_pet and not self._sleeping and not self._hanging
             and not self._dnm and self._drag_offset is None)
@@ -915,10 +933,13 @@ class PetWindow(QWidget):
         if not self._cfg.get("work_sync_enabled", True):
             if self._working:
                 self._working = False
+                self.work_changed.emit(False)
                 self._renderer.set_work(False)
             return
         active = self._system_idle_seconds() < self.WORK_ACTIVE_SECONDS
-        self._working = active
+        if active != self._working:
+            self._working = active
+            self.work_changed.emit(active)
         # 光标靠近宠物时眼神跟随优先，不覆盖工作图
         if active and not self._gaze_active:
             self._renderer.set_work(True)
@@ -1045,10 +1066,13 @@ class PetWindow(QWidget):
     def contextMenuEvent(self, event):
         menu = QMenu(self)
         act_settings = QAction("设置…", menu)
+        act_restart = QAction("重启", menu)
         act_quit = QAction("退出", menu)
         act_settings.triggered.connect(self.settings_requested.emit)
+        act_restart.triggered.connect(self.restart_requested.emit)
         act_quit.triggered.connect(self.quit_requested.emit)
         menu.addAction(act_settings)
+        menu.addAction(act_restart)
         menu.addSeparator()
         menu.addAction(act_quit)
         menu.exec(event.globalPos())

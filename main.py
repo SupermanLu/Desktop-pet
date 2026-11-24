@@ -11,8 +11,8 @@ import random
 import time
 from datetime import datetime
 
-from PySide6.QtCore import Qt, QTimer, QPoint, QEvent, QObject
-from PySide6.QtGui import QIcon, QAction, QPixmap, QGuiApplication
+from PySide6.QtCore import Qt, QTimer, QPoint, QEvent, QObject, QUrl, QProcess
+from PySide6.QtGui import QIcon, QAction, QPixmap, QGuiApplication, QDesktopServices
 from PySide6.QtWidgets import (QApplication, QSystemTrayIcon, QMenu,
                                QMessageBox, QInputDialog)
 
@@ -30,8 +30,16 @@ from core import stats
 from core import achievements
 from core.growth import GrowthManager
 from core.clipboard_watcher import ClipboardWatcher, TYPE_NAMES
+from core.clip_history import ClipHistory
+from ui.clip_history import ClipHistoryWindow
+from core.translator import translate_to_chinese
+from core.weather import fetch_weather, get_weather_reminder
+from core.exchange_rate import auto_convert as convert_currency
+from core.unit_converter import auto_convert as convert_unit
+from core.screen_word_picker import ScreenWordPicker
 from core.key_hook import GlobalHotkey, DEFAULT_MAP
 from core.sound_manager import SoundManager
+from core.music import MusicController
 from ui.action_bubble import ActionBubble
 from ui.mood_chart import MoodChartDialog
 from ui.focus_chart import FocusChartDialog
@@ -42,6 +50,7 @@ from ui.pet_window import PetWindow
 from ui.circle_menu import CircleMenu
 from ui.chat_dialog import ChatDialog
 from ui.settings_dialog import SettingsDialog
+from ui.music_bar import MusicBar, LyricLine
 
 
 class _EscCloseFilter(QObject):
@@ -331,6 +340,13 @@ def main():
         ai.tool_result(req.get("id", ""), result)
     ai.tool_request.connect(on_tool_request)
 
+    # ---- 剪贴板历史（本地保存最近复制内容，可搜索/重新复制） ----
+    clip_hist = ClipHistory(cfg)
+    clip_hist_win = ClipHistoryWindow(clip_hist)
+
+    def open_clip_history():
+        clip_hist_win.show_near(pet.geometry())
+
     # ---- 剪贴板助手（隐私沙盒·主动层，默认关闭） ----
     clip_watcher = ClipboardWatcher()
     clip_watcher.set_prefs(cfg.get("clipboard_prefs", {}))
@@ -377,7 +393,13 @@ def main():
         ctype, content = clip_pending["type"], clip_pending["content"]
         if not ctype:
             return
-        if action == "save":
+        if action == "open":
+            url = content if content.startswith(("http://", "https://")) \
+                else "https://" + content
+            QDesktopServices.openUrl(QUrl(url))
+            pet.show_bubble(f"已用浏览器打开链接 ", 2200)
+            sfx.play("notify")
+        elif action == "save":
             name = ""
             # 代码/笔记是按文件保存：保存前让用户命名；取消命名则放弃保存
             if ctype in ("code", "note"):
@@ -402,6 +424,27 @@ def main():
             pet.show_bubble(do_clip_save(ctype, content), 2600)
             sfx.play("proud")
             pet.play_action("proud", 2.0)
+        elif action == "translate":
+            translated = translate_to_chinese(content)
+            if translated:
+                pet.show_bubble(f"翻译：{translated}", 4000)
+                sfx.play("notify")
+            else:
+                pet.show_bubble("翻译失败，请稍后再试～", 2200)
+        elif action == "convert_amount":
+            result = convert_currency(content)
+            if result:
+                pet.show_bubble(f"💱 {result}", 4000)
+                sfx.play("notify")
+            else:
+                pet.show_bubble("汇率转换失败，请检查格式～", 2200)
+        elif action == "convert_unit":
+            result = convert_unit(content)
+            if result:
+                pet.show_bubble(f"📏 {result}", 4000)
+                sfx.play("notify")
+            else:
+                pet.show_bubble("单位换算失败，请检查格式～", 2200)
         elif action in ("explain", "summarize"):
             ask_ai_about_content(ctype, content)
         elif action == "dismiss":
@@ -421,22 +464,48 @@ def main():
         clip_pending["type"] = ctype
         clip_pending["content"] = content
         sfx.play("notify")
-        labels = {"url": "链接", "code": "代码", "command": "命令", "text": "长文本"}
+        labels = {"url": "链接", "code": "代码", "command": "命令", "text": "长文本",
+                  "foreign": "外文", "amount": "金额", "unit": "单位"}
         title = f"检测到你复制了一个{labels.get(ctype, '')}"
         preview = content[:30].replace("\n", " ")
         title += f"：{preview}…" if preview else ""
         btns = []
         if ctype == "url":
-            btns = [("🔖 收藏", "save"), ("总是允许", "always"), ("✕ 忽略", "dismiss")]
+            btns = [("🌐 打开", "open"), ("🔖 收藏", "save"), ("✕ 忽略", "dismiss")]
         elif ctype == "code":
             btns = [("📁 保存", "save"), ("🧠 解释", "explain"), ("✕ 忽略", "dismiss")]
         elif ctype == "command":
             btns = [("🛡 解释安全性", "explain"), ("✕ 忽略", "dismiss")]
+        elif ctype == "foreign":
+            btns = [("🌐 翻译", "translate"), ("📝 存档", "save"), ("✕ 忽略", "dismiss")]
+        elif ctype == "amount":
+            btns = [("💱 转换汇率", "convert_amount"), ("✕ 忽略", "dismiss")]
+        elif ctype == "unit":
+            btns = [("📏 单位换算", "convert_unit"), ("✕ 忽略", "dismiss")]
         else:
             btns = [("📝 存档", "save"), ("📄 摘要", "summarize"), ("✕ 忽略", "dismiss")]
         clip_bubble.popup(title, btns, _clip_anchor(), timeout_ms=15000)
 
     clip_watcher.detected.connect(on_clip_detected)
+
+    # ---- 屏幕取词/划词翻译（Ctrl+Alt+T 触发） ----
+    screen_picker = ScreenWordPicker()
+    screen_picker_bubble = ActionBubble()
+    pet.register_follow_bubble(screen_picker_bubble)
+
+    def on_screen_word_picked(original: str, translated: str, pos: QPoint):
+        """屏幕取词回调：显示翻译结果气泡"""
+        # 显示原文和翻译
+        display_text = f"📖 {original}\n→ {translated}"
+        screen_picker_bubble.popup_simple(display_text, pos, timeout_ms=8000)
+        sfx.play("notify")
+
+    screen_picker.word_picked.connect(on_screen_word_picked)
+
+    # 将屏幕取词的键盘事件集成到全局快捷键
+    # 注意：需要在 key_hook.py 中添加 Ctrl+Alt+T 的处理
+    # 这里先通过配置启用/禁用
+    screen_picker.set_enabled(cfg.get("screen_picker_enabled", True))
 
     # ---- 情绪日记（极简版）：纯本地记录，只在用户聊天互动时偶尔问一次 ----
     mood_bubble = ActionBubble()
@@ -562,6 +631,36 @@ def main():
     housekeeping.start(30 * 60_000)
     QTimer.singleShot(4500, _housekeeping)   # 启动问候播完后跑一次
 
+    # ---- 天气联动提醒（每天早晚各一次，根据配置城市获取天气） ----
+    _weather_reminded_today = {"date": ""}
+
+    def _check_weather_reminder():
+        """检查是否需要天气提醒：每天最多提醒一次（早上8-10点优先）。"""
+        if not cfg.get("weather_reminder_enabled", True):
+            return
+        today = datetime.now().strftime("%Y-%m-%d")
+        if _weather_reminded_today["date"] == today:
+            return
+        hour = datetime.now().hour
+        if not (8 <= hour <= 20):  # 只在8点到20点之间提醒
+            return
+        city = cfg.get("weather_city", "")
+        if not city:
+            return
+        weather_data = fetch_weather(city)
+        if not weather_data:
+            return
+        reminder_text = get_weather_reminder(weather_data)
+        if reminder_text:
+            _weather_reminded_today["date"] = today
+            pet.show_bubble(reminder_text, 4500)
+            sfx.play("reminder")
+
+    weather_timer = QTimer()
+    weather_timer.timeout.connect(_check_weather_reminder)
+    weather_timer.start(60 * 60_000)  # 每小时检查一次
+    QTimer.singleShot(10000, _check_weather_reminder)  # 启动10秒后先检查一次
+
     # 统计/情绪图表需持有引用，否则函数返回后对象被 Python GC 回收，
     # 窗口会一闪而过（见 open_stats / on_mood_choice）
     stats_dlg_ref = {"dlg": None}
@@ -653,6 +752,102 @@ def main():
     growth.leveled_up.connect(_on_leveled_up)
     growth.streaked.connect(lambda days: pet.show_bubble(
         f"🔥 连续陪伴 {days} 天啦！", 2600) if days >= 2 else None)
+
+    # ---- 音乐（网易云集成：媒体键控制 + SMTC 检测 + 悬停控制栏） ----
+    music = MusicController(cfg)
+    music_bar = MusicBar(cfg, music, pet)    # 悬停控制栏
+    lyric_line = LyricLine(cfg, music, pet)  # 宠物下方常驻歌词（"词"键开关）
+    music_bar.set_lyric_layer(lyric_line)
+    lyric_bubble = ActionBubble()            # 歌词手动搜索兜底气泡
+    pet.register_follow_bubble(lyric_bubble)
+    pet.register_follow_bubble(lyric_line)   # 歌词随宠物移动/全屏隐藏
+    pet.register_follow_bubble(music_bar)    # 控制栏随宠物移动/全屏隐藏
+
+    # ---- 听歌形象：播放中"听音乐/听音乐2"两图交替；边工作边听 → 组合图 ----
+    MUSIC_POSES = ["music", "music2"]
+    _music_pose = {"playing": False, "work": False, "i": 0}
+
+    def _apply_music_pose():
+        """按 播放/工作 状态选择常驻听歌形象。"""
+        if not cfg.get("music_pet_action", True):
+            return
+        if _music_pose["work"]:
+            pet.set_persistent_action("work_music")   # 边工作边听音乐
+        else:
+            pet.set_persistent_action(
+                MUSIC_POSES[_music_pose["i"] % len(MUSIC_POSES)])
+
+    def _on_music_track(title, artist):
+        """切歌：气泡报歌名 + 宠物切听歌形象。"""
+        pet.show_bubble(f"🎵《{title}》{artist}" if artist
+                        else f"🎵《{title}》", 2600)
+        if _music_pose["playing"]:
+            _apply_music_pose()
+
+    def _on_music_state(playing):
+        pet.set_music_notes(playing)   # 播放中：两侧音符特效
+        _music_pose["playing"] = playing
+        if not cfg.get("music_pet_action", True):
+            return
+        if playing:
+            _apply_music_pose()
+        else:
+            pet.clear_persistent_action()
+
+    def _on_work_changed(active):
+        """工作状态变化：播放中切"边工作边听音乐"组合图。"""
+        _music_pose["work"] = active
+        if _music_pose["playing"]:
+            _apply_music_pose()
+    pet.work_changed.connect(_on_work_changed)
+
+    # 听歌两图交替（8 秒一轮，让听歌姿态有"跟着节奏动"的感觉）
+    _music_rot_timer = QTimer()
+    _music_rot_timer.setInterval(8000)
+
+    def _rotate_music_pose():
+        if not _music_pose["playing"] or _music_pose["work"]:
+            return
+        _music_pose["i"] += 1
+        _apply_music_pose()
+    _music_rot_timer.timeout.connect(_rotate_music_pose)
+    _music_rot_timer.start()
+
+    def _on_music_heart(liked):
+        """卡片 ♡ 喜欢：宠物飘爱心回应。"""
+        if liked:
+            pet.show_prop("heart", 1.6)
+            pet.show_bubble("❤ 已喜欢～", 1500)
+
+    def _on_lyric_failed(_reason):
+        """自动匹配不到歌词：按设置弹手动搜索兜底（或只显示歌名）。"""
+        if cfg.get("lyric_fallback", "manual") != "manual":
+            return
+        title, _a = music.session.track
+        lyric_bubble.popup(
+            f"没找到《{title}》的歌词～要手动搜一下吗？",
+            [("手动搜歌词", "manual"), ("只显示歌名", "dismiss")],
+            _pet_rect().center(), timeout_ms=15000)
+
+    def _on_lyric_choice(key):
+        if key != "manual":
+            return
+        title, _a = music.session.track
+        kw, ok = QInputDialog.getText(pet, "手动搜歌词",
+                                      "输入歌名或关键词重新搜索：", text=title)
+        if ok and kw.strip():
+            music.search_manual(kw)
+
+    music.track_changed.connect(_on_music_track)
+    music.state_changed.connect(_on_music_state)
+    music.lyric_failed.connect(_on_lyric_failed)
+    music_bar.heart_toggled.connect(_on_music_heart)
+    lyric_bubble.chosen.connect(_on_lyric_choice)
+    # 悬停桌宠 → 浮现控制栏（歌词在控制栏内，"词"键/快捷键M开关）
+    pet.hover_changed.connect(music_bar.notify_hover)
+    if cfg.get("music_enabled", True):
+        music.start()
+
     # ---- 番茄钟专注形象：专注期轮换 4 张，完成显示“完成任务”，休息显示“伸懒腰” ----
     FOCUS_ROTATE = ["focus_work", "focus_note", "focus_read", "focus_think"]
     _pomo_rot = {"i": 0}
@@ -760,6 +955,7 @@ def main():
             {"key": "chat", "name": "聊天", "icon": "💬"},
             {"key": "aiweb", "name": "AI直达", "icon": "🤖"},
             {"key": "tools", "name": "工具", "icon": "🧰"},
+            {"key": "clips", "name": "剪贴板", "icon": "📋"},
             {"key": "rps", "name": "猜拳", "icon": "🪨"},
             {"key": "stats", "name": "统计", "icon": "📊"},
             {"key": "remind", "name": "提醒", "icon": rem_icon},
@@ -949,6 +1145,8 @@ def main():
             open_stats()
         elif key == "tools":
             show_tools()
+        elif key == "clips":
+            open_clip_history()
 
     # ---- AI 网页快捷入口（半自动：开网页 + 内容留剪贴板，你粘贴即可） ----
     aiweb_bubble = ActionBubble()
@@ -1029,9 +1227,23 @@ def main():
             tray.setIcon(build_tray_icon(cfg))
             # 生日/节日开关变化后立即刷新节日形象
             reminder.refresh_festival_idle()
+            # 音乐歌词开关即时生效（宠物下方歌词行）
+            music_bar.sync_lyric_from_cfg()
 
     pet.clicked.connect(show_circle_menu)
     pet.settings_requested.connect(lambda: open_settings(pet, cfg))
+    def _on_restart():
+        """重启桌宠：另起新实例后退出当前实例（更新/调试方便）。
+
+        退出走 app.quit() → aboutToQuit 里统一存配置/停快捷键；
+        新实例以相同命令行（当前解释器 + 启动脚本）在脚本目录启动。
+        """
+        script = os.path.abspath(__file__)
+        QProcess.startDetached(sys.executable, [script] + sys.argv[1:],
+                               os.path.dirname(script))
+        app.quit()
+
+    pet.restart_requested.connect(_on_restart)
     pet.quit_requested.connect(app.quit)
 
     # ---- 全局快捷键（Ctrl+Alt+字母，无需点击直接调用功能） ----
@@ -1058,6 +1270,16 @@ def main():
             toggle_pomodoro()
         elif func_key == "dnm":
             toggle_dnm()
+        elif func_key == "music_play":
+            music.play_pause()
+        elif func_key == "music_next":
+            music.next_track()
+        elif func_key == "music_prev":
+            music.prev_track()
+        elif func_key == "music_lyric":
+            music_bar.toggle_lyric()
+        elif func_key == "clips":
+            open_clip_history()
 
     def _on_hotkey_ready(failed: list):
         if failed:
@@ -1074,13 +1296,14 @@ def main():
         tools = [w for w in _tool_wins.values() if w is not None]
         menu = menu_ref.get("menu")   # 当前打开的圆盘菜单（None=未打开）
         return [aiweb_bubble, clip_bubble, mood_bubble, rps_bubble, menu,
-                tools_panel] + tools
+                tools_panel, clip_hist_win] + tools
 
     _esc_filter = _EscCloseFilter(_esc_targets)
     app.installEventFilter(_esc_filter)
 
     app.aboutToQuit.connect(
-        lambda: (energy.snapshot(), save_config(cfg), hotkeys.stop()))
+        lambda: (energy.snapshot(), clip_hist.flush(), save_config(cfg),
+                 hotkeys.stop()))
 
     return app.exec()
 
